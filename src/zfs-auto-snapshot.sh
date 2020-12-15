@@ -42,6 +42,7 @@ opt_verbose=''
 opt_pre_snapshot=''
 opt_post_snapshot=''
 opt_do_snapshots=1
+opt_min_size=0
 
 # Global summary statistics.
 DESTRUCTION_COUNT='0'
@@ -110,7 +111,7 @@ print_log () # level, message, ...
 			;;
 		(inf*)
 			# test -n "$opt_syslog" && logger -t "$opt_prefix" -p daemon.info $*
-			test -z ${opt_quiet+x} && test -n "$opt_verbose" && echo $*
+			test -z "$opt_quiet" && test -n "$opt_verbose" && echo $*
 			;;
 		(deb*)
 			# test -n "$opt_syslog" && logger -t "$opt_prefix" -p daemon.debug $*
@@ -161,7 +162,23 @@ do_snapshots () # properties, flags, snapname, oldglob, [targets...]
 
 	for ii in $TARGETS
 	do
-		if [ -n "$opt_do_snapshots" ]
+                # Check if size check is > 0
+                size_check_skip=0
+                if [ "$opt_min_size" -gt 0 ]
+                then
+                        bytes_written=`zfs get -Hp -o value written $ii`
+                        kb_written=$(( $bytes_written / 1024 ))
+                        if [ "$kb_written" -lt "$opt_min_size" ]
+                        then
+                                size_check_skip=1
+                                if [ $opt_verbose -gt 0 ]
+                                then
+                                        echo "Skipping target $ii, only $kb_written kB written since last snap. opt_min_size is $opt_min_size"
+                                fi
+                        fi
+                fi
+
+                if [ -n "$opt_do_snapshots" -a "$size_check_skip" -eq 0 ]
 		then
 			if [ "$opt_pre_snapshot" != "" ]
 			then
@@ -174,7 +191,7 @@ do_snapshots () # properties, flags, snapname, oldglob, [targets...]
 			else
 				WARNING_COUNT=$(( $WARNING_COUNT + 1 ))
 				continue
-			fi 
+			fi
 		fi
 
 		# Retain at most $opt_keep number of old snapshots of this filesystem,
@@ -191,7 +208,7 @@ do_snapshots () # properties, flags, snapname, oldglob, [targets...]
 				KEEP=$(( $KEEP - 1 ))
 				if [ "$KEEP" -le '0' ]
 				then
-					if do_run "zfs destroy -d $FLAGS '$jj'" 
+					if do_run "zfs destroy -d $FLAGS '$jj'"
 					then
 						DESTRUCTION_COUNT=$(( $DESTRUCTION_COUNT + 1 ))
 					else
@@ -207,12 +224,19 @@ do_snapshots () # properties, flags, snapname, oldglob, [targets...]
 # main ()
 # {
 
-GETOPT=$(getopt \
+if [ "$(uname)" = "Darwin" ]; then
+  GETOPT_BIN="$(brew --prefix gnu-getopt 2> /dev/null || echo /usr/local)/bin/getopt"
+else
+  GETOPT_BIN="getopt"
+fi
+
+GETOPT=$($GETOPT_BIN \
   --longoptions=default-exclude,dry-run,fast,skip-scrub,recursive \
   --longoptions=event:,keep:,label:,prefix:,sep: \
   --longoptions=debug,help,quiet,syslog,verbose \
   --longoptions=pre-snapshot:,post-snapshot:,destroy-only \
-  --options=dnshe:l:k:p:rs:qgv \
+  --longoptions=min-size: \
+  --options=dnshe:l:k:p:rs:qgvm: \
   -- "$@" ) \
   || exit 128
 
@@ -271,6 +295,10 @@ do
 			opt_label="$2"
 			shift 2
 			;;
+		(-m|--min-size)
+			opt_min_size="$2"
+			shift 2
+			;;
 		(-p|--prefix)
 			opt_prefix="$2"
 			while test "${#opt_prefix}" -gt '0'
@@ -297,7 +325,7 @@ do
 			shift 1
 			;;
 		(--sep)
-			case "$2" in 
+			case "$2" in
 				([[:alnum:]_.:\ -])
 					:
 					;;
@@ -345,7 +373,7 @@ if [ "$#" -eq '0' ]
 then
 	print_log error "The filesystem argument list is empty."
 	exit 133
-fi 
+fi
 
 # Count the number of times '//' appears on the command line.
 SLASHIES='0'
@@ -374,12 +402,24 @@ ZFS_LIST=$(env LC_ALL=C zfs list -H -t filesystem,volume -s name \
 
 if [ -n "$opt_fast_zfs_list" ]
 then
- 	SNAPSHOTS_OLD=$(env LC_ALL=C zfs list -H -t snapshot -o name -s name | \
-		grep $opt_prefix | \
-		awk '{ print substr( $0, length($0) - 14, length($0) ) " " $0}' | \
-		sort -r -k1,1 -k2,2 | \
-		awk '{ print substr( $0, 17, length($0) )}') \
-	  || { print_log error "zfs list $?: $SNAPSHOTS_OLD"; exit 137; }
+	# Check if a snapshot label is being used, in which case restrict the old
+	# snapshot removal to only snapshots with the same label format
+	if [ -n "$opt_label" ]
+	then
+		SNAPSHOTS_OLD=$(env LC_ALL=C zfs list -H -t snapshot -o name -s name | \
+			grep "$opt_prefix"_"$opt_label" | \
+			awk '{ print substr( $0, length($0) - 14, length($0) ) " " $0}' | \
+			sort -r -k1,1 -k2,2 | \
+			awk '{ print substr( $0, 17, length($0) )}') \
+	  	|| { print_log error "zfs list $?: $SNAPSHOTS_OLD"; exit 137; }
+	else
+ 		SNAPSHOTS_OLD=$(env LC_ALL=C zfs list -H -t snapshot -o name -s name | \
+			grep $opt_prefix | \
+			awk '{ print substr( $0, length($0) - 14, length($0) ) " " $0}' | \
+			sort -r -k1,1 -k2,2 | \
+			awk '{ print substr( $0, 17, length($0) )}') \
+	  	|| { print_log error "zfs list $?: $SNAPSHOTS_OLD"; exit 137; }
+	fi
 else
         SNAPSHOTS_OLD=$(env LC_ALL=C zfs list -H -t snapshot -S creation -o name) \
 	  || { print_log error "zfs list $?: $SNAPSHOTS_OLD"; exit 137; }
@@ -442,11 +482,19 @@ do
 	iii="$ii/"
 
 
-        # Exclude datasets that are not named on the command line.
+	# Exclude datasets
+	# * that are not named on the command line or
+	# * those whose prefix is not on the command line (if --recursive flag is set)
 	IN_ARGS='0'
 	for jj in "$@"
 	do
+		# Ibid regarding iii.
+		jjj="$jj/"
+
 		if [ "$jj" = '//' -o "$jj" = "$ii" ]
+		then
+			IN_ARGS=$(( $IN_ARGS + 1 ))
+		elif [ -n "$opt_recursive" -a "$iii" != "${iii#$jjj}" ]
 		then
 			IN_ARGS=$(( $IN_ARGS + 1 ))
 		fi
@@ -536,13 +584,14 @@ SNAPPROP="-o com.sun:auto-snapshot-desc='$opt_event'"
 
 # ISO style date; fifteen characters: YYYY-MM-DD-HHMM
 # On Solaris %H%M expands to 12h34.
-DATE=$(date --utc +%F-%H%M)
+# We use the shortfirm -u here because --utc is not supported on macos.
+DATE=$(date -u +%F-%H%M)
 
 # The snapshot name after the @ symbol.
-SNAPNAME="$opt_prefix${opt_label:+$opt_sep$opt_label}-$DATE"
+SNAPNAME="${opt_prefix:+$opt_prefix$opt_sep}${opt_label:+$opt_label}-$DATE"
 
 # The expression for matching old snapshots.  -YYYY-MM-DD-HHMM
-SNAPGLOB="$opt_prefix${opt_label:+?$opt_label}????????????????"
+SNAPGLOB="${opt_prefix:+$opt_prefix$opt_sep}${opt_label:+$opt_label}-???????????????"
 
 if [ -n "$opt_do_snapshots" ]
 then
